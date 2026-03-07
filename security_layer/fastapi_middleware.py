@@ -13,7 +13,7 @@ Usage:
     async def run_agent(request: AgentRequest):
         ...  # input already scanned, rate limited before it gets here
 """
-from ..core import AgentShield, ShieldConfig, SecurityViolation, RateLimitExceeded
+from .core import AgentShield, ShieldConfig, SecurityViolation, RateLimitExceeded
 
 
 def add_agentshield(app, config: ShieldConfig = None):
