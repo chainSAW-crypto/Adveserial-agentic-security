@@ -12,6 +12,9 @@ from typing import Callable, Optional, Any
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
+from .llama_guard import LlamaGuard
+from .ssrf_guard import ssrf_guard
+
 
 logger = logging.getLogger("agentshield")
 
@@ -437,7 +440,9 @@ class AgentShield:
         self.output_filter = OutputFilter(system_prompt=self.config.system_prompt)
         self.memory = MemoryGuard(ttl_seconds=self.config.memory_ttl_seconds)
         self._active = True
-        logger.info("AgentShield initialized — all 5 layers active")
+        self.llama_guard = LlamaGuard()
+        self.ssrf_guard = ssrf_guard
+        logger.info("AgentShield initialized — all 5 layers active + SSRFGuard")
 
     # ── Full lifecycle wrapper ──
 
@@ -456,6 +461,11 @@ class AgentShield:
         import signal
 
         # 1. Input scan
+        # LlamaGuard moderation before input_guard
+        moderation_result = self.llama_guard.moderate_input(user_input)
+        if not moderation_result.safe:
+            self.audit.record("LLAMA_GUARD", "BLOCKED", user_id, moderation_result.blocked_message, "HIGH")
+            raise SecurityViolation("LLAMA_GUARD", moderation_result.blocked_message, "HIGH")
         safe_input = self.check_input(user_input, user_id)
 
         # 2. Rate limit
@@ -473,7 +483,13 @@ class AgentShield:
             signal.alarm(0)
             signal.signal(signal.SIGALRM, old)
 
-        # 4. Filter output
+        # 4. LlamaGuard moderation on output
+        moderation_result_out = self.llama_guard.moderate_output(user_input, raw_output)
+        if not moderation_result_out.safe:
+            self.audit.record("LLAMA_GUARD", "BLOCKED", user_id, moderation_result_out.blocked_message, "HIGH")
+            raise SecurityViolation("LLAMA_GUARD", moderation_result_out.blocked_message, "HIGH")
+
+        # 5. Filter output
         safe_output = self.filter_output(raw_output, user_id)
 
         return safe_output
@@ -490,6 +506,14 @@ class AgentShield:
 
     def check_tool(self, tool_name: str, tool_args: dict, user_id: str) -> bool:
         """Layer 3: Validate tool call. Returns True or raises."""
+        # SSRFGuard: Validate URLs in tool arguments before tool firewall
+        urls_to_check = []
+        for k, v in tool_args.items():
+            if isinstance(v, str):
+                all_safe, violations = self.ssrf_guard.validate_urls_in_text(v)
+                if not all_safe:
+                    self.audit.record("SSRF_GUARD", "BLOCKED", user_id, f"Blocked URLs: {violations}", "HIGH")
+                    raise SecurityViolation("SSRF_GUARD", f"Blocked URLs: {violations}", "HIGH")
         return self.tool_firewall.check(tool_name, tool_args, user_id, self.audit)
 
     def filter_output(self, text: str, user_id: str) -> str:
