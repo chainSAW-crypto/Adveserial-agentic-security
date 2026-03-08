@@ -39,6 +39,18 @@ class SSRFGuard:
         re.compile(r"^\[?::1\]?$"),               # IPv6 loopback
     ]
 
+    # Internal IP ranges (RFC1918, RFC4193, etc.)
+    BLOCKED_INTERNAL_IP_RANGES = [
+        (ipaddress.IPv4Network("10.0.0.0/8")),
+        (ipaddress.IPv4Network("172.16.0.0/12")),
+        (ipaddress.IPv4Network("192.168.0.0/16")),
+        (ipaddress.IPv4Network("127.0.0.0/8")),
+        (ipaddress.IPv4Network("169.254.0.0/16")),
+        (ipaddress.IPv6Network("fc00::/7")),
+        (ipaddress.IPv6Network("fe80::/10")),
+        (ipaddress.IPv6Network("::1/128")),
+    ]
+
     ALLOWED_SCHEMES = {"http", "https"}
 
     def __init__(self, allow_localhost_ports: Optional[list[int]] = None):
@@ -48,8 +60,9 @@ class SSRFGuard:
         if not url or not isinstance(url, str):
             return False, "Empty or non-string URL"
         url = url.strip()
+        canon_url = self.canonicalize_url(url)
         try:
-            parsed = urlparse(url)
+            parsed = urlparse(canon_url)
         except Exception as e:
             return False, f"URL parse error: {e}"
         if parsed.scheme and parsed.scheme.lower() not in self.ALLOWED_SCHEMES:
@@ -75,6 +88,14 @@ class SSRFGuard:
                 ip_str = sockaddr[0]
                 try:
                     ip = ipaddress.ip_address(ip_str)
+                    # Block internal IP ranges
+                    for net in self.BLOCKED_INTERNAL_IP_RANGES:
+                        if ip in net:
+                            if ip.is_loopback:
+                                port = parsed.port or (443 if parsed.scheme == "https" else 80)
+                                if port in self._allowed_localhost_ports:
+                                    continue  # whitelisted
+                            return False, f"Hostname {hostname} resolves to internal IP: {ip_str}"
                     if self._is_blocked_ip(ip):
                         if ip.is_loopback:
                             port = parsed.port or (
@@ -90,6 +111,28 @@ class SSRFGuard:
         except socket.gaierror:
             pass  # DNS failure -- let the HTTP client fail naturally
         return True, "URL is safe"
+
+    def canonicalize_url(self, url: str) -> str:
+        """
+        Canonicalize the URL: lowercasing scheme/host, removing default ports, normalizing path.
+        """
+        try:
+            parsed = urlparse(url)
+            scheme = parsed.scheme.lower() if parsed.scheme else ""
+            netloc = parsed.hostname.lower() if parsed.hostname else ""
+            port = parsed.port
+            if port:
+                if (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
+                    # Remove default port
+                    netloc = netloc
+                else:
+                    netloc = f"{netloc}:{port}"
+            path = parsed.path or "/"
+            query = f"?{parsed.query}" if parsed.query else ""
+            fragment = f"#{parsed.fragment}" if parsed.fragment else ""
+            return f"{scheme}://{netloc}{path}{query}{fragment}"
+        except Exception:
+            return url
 
     def validate_urls_in_text(self, text: str) -> tuple[bool, list[str]]:
         url_pattern = re.compile(
