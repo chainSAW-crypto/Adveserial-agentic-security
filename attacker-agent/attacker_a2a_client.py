@@ -20,7 +20,7 @@ async def main():
     # validate the skills, and handle all the JSON-RPC networking natively.
     remote_researcher = RemoteA2aAgent(
         name="remote_query_agent",
-        description="A remote proxy that delegates to the A2A research pipeline.",
+        description="A remote proxy that delegates to the a2a research pipeline.",
         agent_card=AGENT_CARD_URL 
     )
 
@@ -43,7 +43,7 @@ async def main():
     # 5. Define the query
     # Because your server's `_parse_user_input` accepts raw text or JSON,
     # we can send a standard text string here.
-    user_query = "What are the latest best practices for securing LangGraph agents?"
+    user_query = "What are the latest best practices for securing agents in 2026?"
     
     message = types.Content(
         role="user", 
