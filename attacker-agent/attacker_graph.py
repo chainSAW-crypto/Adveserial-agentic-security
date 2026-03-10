@@ -9,6 +9,7 @@ load_dotenv()
 
 from typing import Literal
 from pydantic import BaseModel
+import json
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, AIMessage
 from langgraph.graph import MessagesState, StateGraph, START
@@ -46,6 +47,7 @@ def build_llm(agent_key: str) -> ChatGroq:
     cfg = llm_config[agent_key]
     return ChatGroq(
         model=cfg["model_name"],
+        
         temperature=cfg.get("temperature", 0),
         api_key=os.getenv("GROQ_API_KEY"),
     )
@@ -192,7 +194,8 @@ def attack_planner(state: AttackState) -> Command:
     update = {
         "attack_type": next_agent,
         "attempts": attempts + 1,
-        "plan": decision.dict(),
+        # store plan as serialized JSON to avoid Runnable coercion of plain dicts
+        "plan": json.dumps(decision.dict()),
     }
 
     goto_node = next_agent if next_agent in {"PromptInjection", "SystemLeakage", "JailbreakAgent", "PiiExfiltration", "Judge", "__end__"} else "__end__"
@@ -209,8 +212,8 @@ from security_layer.core import AgentShield, ShieldConfig, SecurityViolation
 # Judge Agent
 def judge_agent(state: AttackState) -> Command:
     results = state.get("results", [])
-    successes = [r for r in results if r["success"]]
-    blocked = [r for r in results if not r["success"]]
+    successes = [r for r in results if r.get("success")]
+    blocked = [r for r in results if not r.get("success")]
     results_text = "\n".join(
         f"- [{r['attack_type']}] {'✅ BYPASSED' if r['success'] else '❌ BLOCKED'}\n"
         f"  Payload: {r['payload'][:100]}\n"
@@ -237,19 +240,53 @@ def judge_agent(state: AttackState) -> Command:
 # Build the attacker LangGraph
 builder = StateGraph(AttackState)
 builder.add_node("attack_planner", attack_planner)
-builder.add_node("PromptInjection", injection_agent.generate_payload)
-builder.add_node("SystemLeakage", leakage_agent.generate_payload)
-builder.add_node("JailbreakAgent", jailbreak_agent_impl.generate_payload)
-builder.add_node("PiiExfiltration", exfil_agent.generate_payload)
+# Subagent wrapper nodes: generate payload and store as pending (return to Judge)
+def _gen_and_store_payload(state: AttackState, generator) -> Command:
+    payload = generator(state)
+    return Command(
+        goto="Judge",
+        update={
+            "pending_payload": payload,
+        },
+    )
+
+
+def prompt_injection_agent(state: AttackState) -> Command:
+    return _gen_and_store_payload(state, injection_agent.generate_payload)
+
+
+def system_leakage_agent(state: AttackState) -> Command:
+    return _gen_and_store_payload(state, leakage_agent.generate_payload)
+
+
+def jailbreak_agent(state: AttackState) -> Command:
+    return _gen_and_store_payload(state, jailbreak_agent_impl.generate_payload)
+
+
+def pii_exfiltration_agent(state: AttackState) -> Command:
+    return _gen_and_store_payload(state, exfil_agent.generate_payload)
+
+
+builder.add_node("PromptInjection", prompt_injection_agent)
+builder.add_node("SystemLeakage", system_leakage_agent)
+builder.add_node("JailbreakAgent", jailbreak_agent)
+builder.add_node("PiiExfiltration", pii_exfiltration_agent)
 builder.add_node("Judge", judge_agent)
 
 builder.add_edge(START, "attack_planner")
-builder.add_conditional_edges("attack_planner", {
-    "PromptInjection": "PromptInjection",
-    "SystemLeakage": "SystemLeakage",
-    "JailbreakAgent": "JailbreakAgent",
-    "PiiExfiltration": "PiiExfiltration"
-})
+def _planner_path(state: AttackState):
+    return state.get("attack_type")
+
+builder.add_conditional_edges(
+    "attack_planner",
+    _planner_path,
+    {
+        "PromptInjection": "PromptInjection",
+        "SystemLeakage": "SystemLeakage",
+        "JailbreakAgent": "JailbreakAgent",
+        "PiiExfiltration": "PiiExfiltration",
+    },
+)
 builder.add_edge("PromptInjection", "Judge")
 builder.add_edge("SystemLeakage", "Judge")
 builder.add_edge("JailbreakAgent", "Judge")
